@@ -1,0 +1,19 @@
+# Секреты и данные аккаунта
+.env
+*.session
+*.session-journal
+data/
+*.db
+*.sqlite3
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+env/
+.venv/
+
+# IDE
+.idea/
+.vscode/
