@@ -17,6 +17,9 @@ from orderbot.classifier import Classifier, extract_json
 from orderbot.config import Config
 from orderbot.db import Database, _from_sqlite_int, _to_sqlite_int
 from orderbot.dedup import DedupIndex, hamming, normalize, simhash
+from orderbot.llm import ChatSession, LLMError, LLMRouter
+from orderbot.llm import accounts as accounts_mod
+from orderbot.llm.accounts import AccountsBackend
 from orderbot.models import Candidate, Verdict
 from orderbot.notifier import build_keyboard, render
 from orderbot.pipeline import Pipeline
@@ -234,10 +237,10 @@ async def test_classifier():
     print("\n[classifier]")
     cfg = Config.load()
     cfg.stage1_chunk = 2
-    clf = Classifier(cfg)
+    clf = Classifier(cfg, StubBackend())
     calls = []
 
-    async def fake_ask(model, system, user, max_tokens, chat=None, attempts=3):
+    async def fake_ask(system, user, max_tokens, chat=None, attempts=3):
         calls.append(user)
         return '{"ids": [1]}'
 
@@ -353,15 +356,15 @@ def test_soft_leads():
 
 async def test_chat_sessions():
     print("\n[чаты с моделью]")
-    from orderbot.classifier import ChatSession
-
     chat = ChatSession("stage1", ttl=3600, history_turns=2, remember_chars=20)
-    first_id, msgs = await chat.begin("система", "вопрос 1")
+    first_id = await chat.begin()
+    msgs = chat.messages("система", "вопрос 1")
     check("в первом запросе только система и вопрос",
           [m["role"] for m in msgs] == ["system", "user"])
 
     await chat.remember(first_id, "в" * 100, "о" * 100)
-    second_id, msgs2 = await chat.begin("система", "вопрос 2")
+    second_id = await chat.begin()
+    msgs2 = chat.messages("система", "вопрос 2")
     check("чат тот же самый", second_id == first_id)
     check("история подхватилась",
           [m["role"] for m in msgs2] == ["system", "user", "assistant", "user"])
@@ -371,34 +374,255 @@ async def test_chat_sessions():
 
     await chat.remember(second_id, "вопрос 2", "ответ 2")
     await chat.remember(second_id, "вопрос 3", "ответ 3")
-    _, msgs3 = await chat.begin("система", "вопрос 4")
+    msgs3 = chat.messages("система", "вопрос 4")
     check("история ограничена history_turns", len(msgs3) == 2 + 2 * 2, f"({len(msgs3)})")
-    check("счётчик запросов", chat.requests == 3, f"({chat.requests})")
+    check("счётчик запросов", chat.requests == 2, f"({chat.requests})")
+
+    chat.payload["chat_id"] = "server-1"
+    dumped = chat.dump()
+    revived = ChatSession("stage1", ttl=3600, history_turns=2)
+    revived.restore(dumped)
+    check("чат поднимается из дампа", revived.session_id == chat.session_id)
+    check("payload переживает рестарт", revived.payload.get("chat_id") == "server-1")
+    check("история переживает рестарт", len(revived.messages("s", "u")) == len(msgs3))
+    check("возраст считается от сохранённого времени", revived.age < 5)
 
     chat.ttl = 60
-    chat._started -= 61                                   # состарили чат
-    rotated_id, msgs4 = await chat.begin("система", "вопрос 5")
+    chat.started -= 61                                    # состарили чат
+    rotated_id = await chat.begin()
     check("чат сменился по времени", rotated_id != first_id)
     check("смена посчитана", chat.rotations == 1)
     check("после смены история пустая",
-          [m["role"] for m in msgs4] == ["system", "user"])
+          [m["role"] for m in chat.messages("s", "u")] == ["system", "user"])
+    check("после смены payload очищен", chat.payload == {})
 
     await chat.remember(first_id, "старое", "ответ")      # ответ из прошлого чата
-    _, msgs5 = await chat.begin("система", "вопрос 6")
     check("в новый чат старое не дописывается",
-          [m["role"] for m in msgs5] == ["system", "user"])
+          [m["role"] for m in chat.messages("s", "u")] == ["system", "user"])
 
     plain = ChatSession("stage2", ttl=3600, history_turns=0)
-    sid, _ = await plain.begin("s", "u")
+    sid = await plain.begin()
     await plain.remember(sid, "u", "a")
-    _, m = await plain.begin("s", "u2")
-    check("history_turns=0 не копит контекст", len(m) == 2)
+    check("history_turns=0 не копит контекст", len(plain.messages("s", "u2")) == 2)
     check("но чат остаётся тем же", plain.session_id == sid)
 
     parallel = ChatSession("stage1", ttl=3600, history_turns=2)
-    ids = await asyncio.gather(*(parallel.begin("s", f"u{i}") for i in range(8)))
+    ids = await asyncio.gather(*(parallel.begin() for _ in range(8)))
     check("параллельные запросы идут в один чат",
-          len({sid for sid, _ in ids}) == 1 and parallel.requests == 8)
+          len(set(ids)) == 1 and parallel.requests == 8)
+
+
+class StubBackend:
+    """Бэкенд-заглушка: не ходит в сеть, считает запросы."""
+
+    name = "stub"
+
+    def __init__(self, answer="ответ", error=None):
+        self.answer = answer
+        self.error = error
+        self.calls = []
+        self.available = True
+
+    async def ask(self, session, system, user, max_tokens):
+        await session.begin()
+        self.calls.append(user)
+        if self.error:
+            raise LLMError(self.error)
+        return self.answer
+
+    def status(self):
+        return self.name
+
+    async def close(self):
+        return None
+
+
+async def test_llm_router():
+    print("\n[выбор бэкенда]")
+    cfg = Config.load()
+    session = ChatSession("stage1", 3600, 0)
+
+    accounts, key = StubBackend("из аккаунта"), StubBackend("по ключу")
+    cfg.llm_backend = "auto"
+    router = LLMRouter(cfg, accounts, key)
+    check("аккаунты в приоритете",
+          await router.ask(session, "s", "u", 10) == "из аккаунта")
+
+    accounts.available = False
+    check("без аккаунтов уходим на ключ",
+          await router.ask(session, "s", "u", 10) == "по ключу")
+
+    accounts.available = True
+    accounts.error = "аккаунт лёг"
+    check("падение аккаунтов подхватывает ключ",
+          await router.ask(session, "s", "u", 10) == "по ключу")
+
+    key.error = "и ключ лёг"
+    try:
+        await router.ask(session, "s", "u", 10)
+        check("оба легли — ошибка наверх", False)
+    except LLMError as exc:
+        check("оба легли — ошибка наверх",
+              "аккаунт лёг" in str(exc) and "и ключ лёг" in str(exc))
+
+    accounts.error = key.error = None
+    cfg.llm_backend = "key"
+    check("режим key игнорирует аккаунты",
+          await router.ask(session, "s", "u", 10) == "по ключу")
+    cfg.llm_backend = "accounts"
+    check("режим accounts игнорирует ключ",
+          await router.ask(session, "s", "u", 10) == "из аккаунта")
+    cfg.llm_backend = "auto"
+
+    accounts.available = key.available = False
+    check("нет ни одного бэкенда — router недоступен", router.available is False)
+
+
+class FakeChat:
+    def __init__(self, chat_id):
+        self.id = chat_id
+        self.prompts = []
+        self.broken = False
+
+    def send(self, prompt, **kwargs):
+        if self.broken:
+            raise RuntimeError("rate limit exceeded")
+        self.prompts.append(prompt)
+        return f"ответ на {prompt[:20]}"
+
+
+class FakeAdapter:
+    """Подменяет вендорную библиотеку — без сети и без логина."""
+
+    def __init__(self):
+        self.logins = []
+        self.chats = []
+        self.bad_login = set()
+
+    def make_client(self, account, store_path):
+        if account.email in self.bad_login:
+            raise RuntimeError("auth failed: неверный пароль")
+        self.logins.append(account.email)
+        return {"email": account.email}
+
+    def new_chat(self, client):
+        chat = FakeChat(f"chat{len(self.chats) + 1}")
+        self.chats.append(chat)
+        return chat
+
+    def resume(self, client, chat_id):
+        for chat in self.chats:
+            if chat.id == chat_id:
+                return chat
+        raise RuntimeError("чат не найден")
+
+    def chat_id(self, chat):
+        return chat.id
+
+    def send(self, chat, prompt):
+        return chat.send(prompt)
+
+
+async def test_accounts_backend(tmp):
+    print("\n[аккаунты нейросети]")
+    db = await open_db(Path(tmp) / "acc.db")
+    cfg = Config.load()
+    cfg.db_path = Path(tmp) / "acc.db"
+    cfg.account_cooldown = 600
+
+    fake = FakeAdapter()
+    original = accounts_mod.ADAPTERS["deepseek"]
+    accounts_mod.ADAPTERS["deepseek"] = fake
+    try:
+        backend = AccountsBackend(cfg, db)
+        check("без аккаунтов бэкенд недоступен", backend.available is False)
+
+        await db.llm_account_add("deepseek", "a@mail", "pass1")
+        await db.llm_account_add("deepseek", "b@mail", "pass2")
+        await backend.reload()
+        check("аккаунты подхватились", len(backend.accounts) == 2)
+        check("с аккаунтом бэкенд доступен", backend.available is True)
+
+        session = ChatSession("stage1", 3600, 0)
+        await backend.ask(session, "СИСТЕМНЫЙ ПРОМПТ", "вопрос 1", 100)
+        await backend.ask(session, "СИСТЕМНЫЙ ПРОМПТ", "вопрос 2", 100)
+        check("чат создан один на всю сессию", len(fake.chats) == 1, f"({len(fake.chats)})")
+        check("залогинились один раз", len(fake.logins) == 1, f"({fake.logins})")
+        prompts = fake.chats[0].prompts
+        check("системный промпт ушёл первым сообщением",
+              prompts[0].startswith("СИСТЕМНЫЙ ПРОМПТ"))
+        check("второй раз система не повторяется", prompts[1] == "вопрос 2")
+        check("аккаунт запомнен в чате", session.payload.get("account_id") is not None)
+        check("id серверного чата сохранён",
+              session.payload["chats"] == {str(session.payload["account_id"]): "chat1"})
+
+        # первый аккаунт начал падать — уходим на второй
+        fake.chats[0].broken = True
+        await backend.ask(session, "СИСТЕМА", "вопрос 3", 100)
+        check("при ошибке ушли на другой аккаунт", len(fake.logins) == 2, f"({fake.logins})")
+        check("на другом аккаунте новый чат", len(fake.chats) == 2)
+        broken = next(a for a in backend.accounts if a.email == "a@mail")
+        check("упавший аккаунт в кулдауне", not broken.usable)
+        check("причина записана", "rate limit" in broken.last_error)
+
+        fresh = AccountsBackend(cfg, db)
+        await fresh.reload()
+        check("кулдаун сохранён в базе",
+              not next(a for a in fresh.accounts if a.email == "a@mail").usable)
+
+        # аккаунт вернулся из кулдауна — продолжаем его прежний чат, а не новый
+        fake.chats[0].broken = False
+        broken.cooldown_until = 0
+        second = next(a for a in backend.accounts if a.email == "b@mail")
+        second.disabled = True
+        chats_before = len(fake.chats)
+        await backend.ask(session, "СИСТЕМА", "вопрос 4", 100)
+        check("вернувшийся аккаунт продолжает свой старый чат",
+              len(fake.chats) == chats_before, f"({chats_before} → {len(fake.chats)})")
+        check("в старом чате систему второй раз не шлём",
+              fake.chats[0].prompts[-1] == "вопрос 4", f"({fake.chats[0].prompts[-1][:40]})")
+        second.disabled = False
+
+        # легли оба
+        for chat in fake.chats:
+            chat.broken = True
+        try:
+            await backend.ask(session, "СИСТЕМА", "вопрос 5", 100)
+            check("все аккаунты легли — ошибка наверх", False)
+        except LLMError as exc:
+            check("все аккаунты легли — ошибка наверх", "mail" in str(exc))
+        check("бэкенд без живых аккаунтов недоступен", backend.available is False)
+
+        await db.llm_account_toggle(backend.accounts[0].id)
+        await backend.reload()
+        check("выключенный аккаунт помечен", backend.accounts[0].disabled is True)
+
+        # после рестарта бота чат продолжается, а не создаётся заново
+        for chat in fake.chats:
+            chat.broken = False
+        restarted = AccountsBackend(cfg, db)
+        await restarted.reload()
+        for account in restarted.accounts:
+            account.cooldown_until = 0
+            account.disabled = False
+        revived = ChatSession("stage1", 3600, 0)
+        revived.restore(session.dump())
+        chats_before = len(fake.chats)
+        await restarted.ask(revived, "СИСТЕМА", "вопрос 6", 100)
+        check("после рестарта чат продолжается, новый не создаётся",
+              len(fake.chats) == chats_before, f"({chats_before} → {len(fake.chats)})")
+
+        # проверка учётных данных при добавлении
+        fake.bad_login.add("bad@mail")
+        try:
+            await backend.check("deepseek", "bad@mail", "wrong")
+            check("проверка ловит неверный пароль", False)
+        except LLMError as exc:
+            check("проверка ловит неверный пароль", "auth failed" in str(exc))
+        answer = await backend.check("deepseek", "new@mail", "right")
+        check("проверка возвращает ответ модели", answer.startswith("ответ на"))
+    finally:
+        accounts_mod.ADAPTERS["deepseek"] = original
 
 
 async def test_pipeline(tmp):
@@ -512,6 +736,7 @@ async def test_dispatcher(tmp):
     from aiogram.enums import ParseMode
 
     from orderbot.bot import HELP, Deps, build_dispatcher
+    from orderbot.llm import build_router
     from orderbot.notifier import Notifier
     from orderbot.userbot import UserBot
 
@@ -520,17 +745,19 @@ async def test_dispatcher(tmp):
     rt = Runtime(cfg, db)
     await rt.load()
     bot = Bot(cfg.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    clf = Classifier(cfg)
+    llm = await build_router(cfg, db)
+    clf = Classifier(cfg, llm, db)
     dedup = DedupIndex(db, 7, 12)
     notifier = Notifier(bot, db, rt)
     pipe = Pipeline(cfg, rt, dedup, clf, notifier)
     ub = UserBot(cfg, db, pipe.ingest)
     dp = build_dispatcher(Deps(cfg=cfg, db=db, runtime=rt, userbot=ub, pipeline=pipe,
-                               classifier=clf, dedup=dedup))
+                               classifier=clf, dedup=dedup, router=llm))
     check("диспетчер собран", dp is not None)
     check("deps проброшены в хендлеры", dp["deps"] is not None)
     check("help перечисляет команды",
-          all(c in HELP for c in ["/login", "/status", "/bl", "/threshold", "/test", "/chats"]))
+          all(c in HELP for c in ["/login", "/status", "/bl", "/threshold", "/test",
+                                  "/chats", "/accounts", "/addaccount"]))
     check("юзербот пока не запущен", ub.is_running is False)
     await clf.close()
     await bot.session.close()
@@ -546,6 +773,8 @@ async def main():
             test_render()
             test_soft_leads()
             await test_chat_sessions()
+            await test_llm_router()
+            await test_accounts_backend(tmp)
             await test_classifier()
             await test_pipeline(tmp)
             await test_state(tmp)

@@ -13,11 +13,10 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-import time
-
-from openai import AsyncOpenAI
 
 from .config import Config
+from .db import Database
+from .llm import ChatSession, LLMBackend, LLMError
 from .models import Candidate, Verdict
 from .utils import log, truncate
 
@@ -146,126 +145,67 @@ def extract_json(raw: str) -> dict | None:
         return None
 
 
-class ChatSession:
-    """Один непрерывный чат с моделью.
-
-    Запрос продолжает предыдущий разговор, а не начинает новый: в модель уходит
-    системный промпт + хвост истории + новый вопрос. Раз в `ttl` секунд чат
-    меняется — так и контекст не тянется бесконечно, и новый диалог не заводится
-    на каждое сообщение. У каждого этапа свой чат.
-
-    В историю кладём обрезанные реплики: на 1-м этапе вопрос — это пачка из
-    25 сообщений, тащить её целиком в каждый следующий запрос слишком дорого.
-    """
-
-    def __init__(self, name: str, ttl: float, history_turns: int,
-                 remember_chars: int = 400):
-        self.name = name
-        self.ttl = max(60.0, ttl)
-        self.history_turns = max(0, history_turns)
-        self.remember_chars = remember_chars
-        self.requests = 0
-        self.rotations = 0
-        self.session_id = ""
-        self._started = 0.0
-        self._seq = 0
-        self._history: list[dict[str, str]] = []
-        self._lock = asyncio.Lock()
-        self._start_new()
-
-    def _start_new(self) -> None:
-        # Номер в id обязателен: две смены внутри одной секунды иначе дали бы
-        # одинаковый id, и ответ из старого чата дописался бы в новый.
-        self._seq += 1
-        self.session_id = f"{self.name}-{int(time.time())}-{self._seq}"
-        self._started = time.monotonic()
-        self._history.clear()
-
-    @property
-    def age(self) -> float:
-        return time.monotonic() - self._started
-
-    async def begin(self, system: str, user: str) -> tuple[str, list[dict[str, str]]]:
-        """Собирает messages для запроса, при необходимости сменив чат."""
-        async with self._lock:
-            if self.age >= self.ttl:
-                self.rotations += 1
-                log.info("Чат %s прожил %.0f мин — перехожу в новый",
-                         self.session_id, self.age / 60)
-                self._start_new()
-            self.requests += 1
-            return self.session_id, [
-                {"role": "system", "content": system},
-                *self._history,
-                {"role": "user", "content": user},
-            ]
-
-    async def remember(self, session_id: str, user: str, answer: str) -> None:
-        if self.history_turns <= 0:
-            return
-        async with self._lock:
-            if session_id != self.session_id:
-                return                    # чат успел смениться, дописывать некуда
-            self._history.append(
-                {"role": "user", "content": truncate(user, self.remember_chars)})
-            self._history.append(
-                {"role": "assistant", "content": truncate(answer, self.remember_chars)})
-            extra = len(self._history) - self.history_turns * 2
-            if extra > 0:
-                del self._history[:extra]
-
-    def info(self) -> str:
-        return (f"{self.session_id} · {int(self.age // 60)} мин · "
-                f"{self.requests} запр. · смен: {self.rotations}")
-
-
 class Classifier:
-    def __init__(self, cfg: Config):
+    def __init__(self, cfg: Config, backend: LLMBackend, db: Database | None = None):
         self.cfg = cfg
-        self._client = AsyncOpenAI(
-            api_key=cfg.llm_key or "missing",
-            base_url=cfg.llm_base_url,
-            timeout=cfg.llm_timeout,
-            max_retries=0,          # ретраим сами, с логом
-        )
+        self.backend = backend
+        self.db = db
         self._sem2 = asyncio.Semaphore(max(1, cfg.stage2_concurrency))
         self.last_error: str = ""
         self.chat1 = ChatSession("stage1", cfg.chat_ttl, cfg.chat_history_turns)
         self.chat2 = ChatSession("stage2", cfg.chat_ttl, cfg.chat_history_turns)
+        self._warned_no_backend = False
+
+    @property
+    def available(self) -> bool:
+        return self.backend.available
+
+    # ------------------------------------------------------------------ состояние чатов
+
+    async def load_state(self) -> None:
+        """Поднимает чаты из базы, чтобы после рестарта не заводить новые."""
+        if self.db is None:
+            return
+        state = await self.db.get("chat_state") or {}
+        for chat in (self.chat1, self.chat2):
+            chat.restore(state.get(chat.name) or {})
+
+    async def save_state(self) -> None:
+        if self.db is None:
+            return
+        if not (self.chat1.dirty or self.chat2.dirty):
+            return
+        await self.db.set("chat_state", {
+            self.chat1.name: self.chat1.dump(),
+            self.chat2.name: self.chat2.dump(),
+        })
+        self.chat1.dirty = self.chat2.dirty = False
 
     async def close(self) -> None:
-        await self._client.close()
+        await self.save_state()
+        await self.backend.close()
 
     # ------------------------------------------------------------------- низкий уровень
 
-    async def _ask(self, model: str, system: str, user: str, max_tokens: int,
+    async def _ask(self, system: str, user: str, max_tokens: int,
                    chat: ChatSession, attempts: int = 3) -> str:
-        session_id, messages = await chat.begin(system, user)
         delay = 1.5
         last_exc: Exception | None = None
         for attempt in range(1, attempts + 1):
             try:
-                resp = await self._client.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    temperature=0,
-                    max_tokens=max_tokens,
-                )
-                content = (resp.choices[0].message.content or "").strip()
-                if content:
-                    self.last_error = ""
-                    await chat.remember(session_id, user, content)
-                    return content
-                last_exc = RuntimeError("пустой ответ модели")
-            except Exception as exc:                       # noqa: BLE001 — логируем любую
+                content = await self.backend.ask(chat, system, user, max_tokens)
+                self.last_error = ""
+                await self.save_state()
+                return content
+            except LLMError as exc:
                 last_exc = exc
-                log.warning("LLM %s: попытка %s/%s не удалась: %s",
-                            model, attempt, attempts, exc)
+                log.warning("LLM: попытка %s/%s не удалась: %s", attempt, attempts, exc)
             if attempt < attempts:
                 await asyncio.sleep(delay)
                 delay *= 2
         self.last_error = str(last_exc) if last_exc else "неизвестная ошибка"
-        raise RuntimeError(f"LLM {model} недоступна: {self.last_error}")
+        await self.save_state()
+        raise RuntimeError(f"LLM недоступна: {self.last_error}")
 
     # ------------------------------------------------------------------- этап 1
 
@@ -273,6 +213,13 @@ class Classifier:
         """Батч-фильтр. Возвращает подмножество кандидатов."""
         if not items:
             return []
+        if not self.backend.available:
+            if not self._warned_no_backend:
+                log.error("Нечем проверять сообщения: добавь аккаунт (/addaccount) "
+                          "или ключ в .env. Пропускаю батчи.")
+                self._warned_no_backend = True
+            return []
+        self._warned_no_backend = False
 
         chunk_size = max(1, self.cfg.stage1_chunk)
         chunks = [items[i:i + chunk_size] for i in range(0, len(items), chunk_size)]
@@ -298,7 +245,6 @@ class Classifier:
         user = "Сообщения:\n" + "\n".join(lines)
 
         raw = await self._ask(
-            self.cfg.model_stage1,
             STAGE1_SYSTEM.format(profile=self.cfg.profile),
             user,
             max_tokens=400,
@@ -340,7 +286,6 @@ class Classifier:
         async with self._sem2:
             try:
                 raw = await self._ask(
-                    self.cfg.model_stage2,
                     STAGE2_SYSTEM.format(profile=self.cfg.profile),
                     user,
                     max_tokens=300,

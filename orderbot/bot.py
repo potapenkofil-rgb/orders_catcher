@@ -22,6 +22,7 @@ from .classifier import Classifier
 from .config import Config
 from .db import Database
 from .dedup import DedupIndex
+from .llm import PROVIDER_TITLES, PROVIDERS, LLMError, LLMRouter
 from .models import Candidate
 from .pipeline import Pipeline
 from .state import Runtime
@@ -40,6 +41,10 @@ HELP = """<b>Ловец заказов</b>
 /login — войти в аккаунт (api_id, api_hash, телефон, код, 2FA)
 /logout — выйти и стереть сессию
 /chats — какие чаты и каналы слушаю
+
+<b>Аккаунты нейросети</b>
+/accounts — список аккаунтов, включить/выключить/удалить
+/addaccount — добавить аккаунт (DeepSeek или Qwen) по email и паролю
 
 <b>Управление</b>
 /status — что происходит прямо сейчас
@@ -67,6 +72,13 @@ class Deps:
     pipeline: Pipeline
     classifier: Classifier
     dedup: DedupIndex
+    router: LLMRouter
+
+
+class AddAccount(StatesGroup):
+    provider = State()
+    email = State()
+    password = State()
 
 
 class Login(StatesGroup):
@@ -281,7 +293,10 @@ async def cmd_status(message: Message, deps: Deps) -> None:
     lines.append("")
     lines.append(f"🚫 В ЧС: {len(rt.banned_users)} польз., {len(rt.banned_chats)} чатов")
     lines.append(f"🎯 Порог уверенности: {rt.min_confidence:.2f}")
-    lines.append(f"🧠 Модели: {esc(deps.cfg.model_stage1)} → {esc(deps.cfg.model_stage2)}")
+    lines.append(f"🧠 Проверка: {esc(deps.router.status())}")
+    if deps.cfg.llm_key and deps.cfg.llm_backend != "accounts":
+        lines.append(f"   модели по ключу: {esc(deps.cfg.model_stage1)} → "
+                     f"{esc(deps.cfg.model_stage2)}")
     lines.append(f"💬 Чат этапа 1: {esc(deps.classifier.chat1.info())}")
     lines.append(f"💬 Чат этапа 2: {esc(deps.classifier.chat2.info())}")
     lines.append(f"🔄 Смена чатов: раз в {deps.cfg.chat_ttl / 3600:.0f} ч")
@@ -418,6 +433,139 @@ async def cmd_test(message: Message, command: CommandObject, deps: Deps) -> None
         f"Бюджет: {esc(verdict.budget or '—')}\n"
         f"Почему: {esc(verdict.reason or '—')}"
     )
+
+
+# ------------------------------------------------------------- аккаунты нейросети
+
+def _accounts_keyboard(account) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text="▶️ Включить" if account.disabled else "⏸ Выключить",
+            callback_data=f"acc_toggle:{account.id}",
+        ),
+        InlineKeyboardButton(text="🗑 Удалить", callback_data=f"acc_del:{account.id}"),
+    ]])
+
+
+@router.message(Command("accounts"))
+async def cmd_accounts(message: Message, deps: Deps) -> None:
+    await deps.router.accounts.reload()
+    accounts = deps.router.accounts.accounts
+    if not accounts:
+        await message.answer(
+            "Аккаунтов нейросети нет.\n\n"
+            "Добавить: /addaccount — понадобится email и пароль от аккаунта "
+            "DeepSeek или Qwen.\n"
+            + ("Пока проверяю по ключу из .env." if deps.cfg.llm_key
+               else "Ключа в .env тоже нет — проверять сообщения сейчас нечем.")
+        )
+        return
+    await message.answer(f"<b>Аккаунты нейросети ({len(accounts)})</b>")
+    for account in accounts:
+        await message.answer(
+            f"<b>{esc(account.title)}</b> · {esc(account.email)}\n{esc(account.state())}",
+            reply_markup=_accounts_keyboard(account),
+        )
+
+
+@router.message(Command("addaccount"))
+async def cmd_addaccount(message: Message, state: FSMContext) -> None:
+    await state.set_state(AddAccount.provider)
+    buttons = [[InlineKeyboardButton(text=PROVIDER_TITLES[p], callback_data=f"acc_prov:{p}")]
+               for p in PROVIDERS]
+    await message.answer(
+        "Какой аккаунт добавляем?\n\n"
+        "Логиниться буду по email и паролю — теми же, что и на сайте.\n"
+        "Отменить — /cancel",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+
+
+@router.callback_query(AddAccount.provider, F.data.startswith("acc_prov:"))
+async def cb_account_provider(call: CallbackQuery, state: FSMContext) -> None:
+    provider = call.data.split(":", 1)[1]
+    if provider not in PROVIDERS:
+        await call.answer("Неизвестный провайдер", show_alert=True)
+        return
+    await state.update_data(provider=provider)
+    await state.set_state(AddAccount.email)
+    await call.answer()
+    await call.message.answer(
+        f"Аккаунт {PROVIDER_TITLES[provider]}. Пришли email."
+    )
+
+
+@router.message(AddAccount.email)
+async def add_account_email(message: Message, state: FSMContext) -> None:
+    email = (message.text or "").strip()
+    if "@" not in email or len(email) < 5:
+        await message.answer("Непохоже на email. Попробуй ещё раз или /cancel")
+        return
+    await state.update_data(email=email)
+    await state.set_state(AddAccount.password)
+    await message.answer("Теперь пароль от этого аккаунта. Сообщение с ним я удалю.")
+
+
+@router.message(AddAccount.password)
+async def add_account_password(message: Message, state: FSMContext, deps: Deps) -> None:
+    password = (message.text or "").strip()
+    await _quiet_delete(message)
+    if not password:
+        await message.answer("Пустой пароль. Попробуй ещё раз или /cancel")
+        return
+    data = await state.get_data()
+    provider, email = data["provider"], data["email"]
+
+    note = await message.answer("Проверяю вход… это займёт полминуты.")
+    try:
+        answer = await deps.router.accounts.check(provider, email, password)
+    except LLMError as exc:
+        await note.edit_text(
+            f"❌ Не вышло: {esc(truncate(str(exc), 300))}\n\n"
+            "Проверь email и пароль. Попробовать снова — /addaccount"
+        )
+        await state.clear()
+        return
+
+    await deps.db.llm_account_add(provider, email, password)
+    await deps.router.accounts.reload()
+    await state.clear()
+    await note.edit_text(
+        f"✅ Аккаунт {esc(PROVIDER_TITLES[provider])} · {esc(email)} добавлен.\n"
+        f"Ответ на проверочный вопрос: <i>{esc(truncate(answer, 100))}</i>\n\n"
+        "Теперь проверка сообщений идёт через него. Все аккаунты — /accounts"
+    )
+
+
+@router.callback_query(F.data.startswith("acc_del:"))
+async def cb_account_delete(call: CallbackQuery, deps: Deps) -> None:
+    account_id = int(call.data.split(":", 1)[1])
+    deps.router.accounts.forget_client(account_id)
+    await deps.db.llm_account_delete(account_id)
+    await deps.router.accounts.reload()
+    await call.answer("Удалил")
+    try:
+        await call.message.edit_text(f"{call.message.html_text}\n\n🗑 Удалён")
+    except Exception:                                     # noqa: BLE001
+        pass
+
+
+@router.callback_query(F.data.startswith("acc_toggle:"))
+async def cb_account_toggle(call: CallbackQuery, deps: Deps) -> None:
+    account_id = int(call.data.split(":", 1)[1])
+    disabled = await deps.db.llm_account_toggle(account_id)
+    await deps.router.accounts.reload()
+    await call.answer("Выключил" if disabled else "Включил")
+    account = next((a for a in deps.router.accounts.accounts if a.id == account_id), None)
+    if account is None:
+        return
+    try:
+        await call.message.edit_text(
+            f"<b>{esc(account.title)}</b> · {esc(account.email)}\n{esc(account.state())}",
+            reply_markup=_accounts_keyboard(account),
+        )
+    except Exception:                                     # noqa: BLE001
+        pass
 
 
 # ------------------------------------------------------------------------------- ЧС

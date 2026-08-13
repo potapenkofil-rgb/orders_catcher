@@ -14,6 +14,7 @@ from .classifier import Classifier
 from .config import Config
 from .db import Database
 from .dedup import DedupIndex
+from .llm import build_router
 from .notifier import Notifier
 from .pipeline import Pipeline
 from .state import Runtime
@@ -58,7 +59,11 @@ async def run() -> None:
     known = await dedup.load()
     log.info("Антидубль: поднято %s записей", known)
 
-    classifier = Classifier(cfg)
+    llm = await build_router(cfg, db)
+    classifier = Classifier(cfg, llm, db)
+    await classifier.load_state()
+    log.info("Проверка сообщений: %s", llm.status())
+
     bot = Bot(cfg.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     notifier = Notifier(bot, db, runtime)
     pipeline = Pipeline(cfg, runtime, dedup, classifier, notifier)
@@ -72,11 +77,21 @@ async def run() -> None:
         pipeline=pipeline,
         classifier=classifier,
         dedup=dedup,
+        router=llm,
     )
     dp = build_dispatcher(deps)
 
     pipeline.start()
     cleanup_task = asyncio.create_task(_cleanup_loop(dedup), name="dedup-cleanup")
+
+    if not llm.available:
+        log.warning("Нечем проверять сообщения: нет ни аккаунтов, ни ключа")
+        if runtime.owner_id:
+            await notifier.send_text(
+                "⚠️ Проверять сообщения нечем.\n\n"
+                "Добавь аккаунт нейросети — /addaccount, либо пропиши "
+                "LLM_API_KEY в .env. Пока лиды искаться не будут."
+            )
 
     if await userbot.try_start_saved():
         account = userbot.account

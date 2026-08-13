@@ -59,7 +59,9 @@ class Config:
     bot_token: str
     owner_id: int | None
 
-    # --- LLM (OpenAI-совместимый эндпоинт, по умолчанию aitunnel) ---
+    # --- LLM ---
+    llm_backend: str           # auto | key | accounts
+    account_cooldown: float    # пауза для аккаунта после ошибки, секунды
     llm_key: str
     llm_base_url: str
     model_stage1: str
@@ -96,6 +98,8 @@ class Config:
         return cls(
             bot_token=os.environ.get("BOT_TOKEN", "").strip(),
             owner_id=int(owner_raw) if owner_raw.lstrip("-").isdigit() else None,
+            llm_backend=(os.environ.get("LLM_BACKEND", "auto").strip().lower() or "auto"),
+            account_cooldown=_float("ACCOUNT_COOLDOWN_MINUTES", 20.0) * 60,
             llm_key=(os.environ.get("LLM_API_KEY") or os.environ.get("AITUNNEL_KEY") or "").strip(),
             llm_base_url=os.environ.get("LLM_BASE_URL", "https://api.aitunnel.ru/v1").strip(),
             model_stage1=os.environ.get("MODEL_STAGE1", "gemini-3.6-flash").strip(),
@@ -117,13 +121,21 @@ class Config:
             debug=bool(os.environ.get("DEBUG", "").strip()),
         )
 
+    def model_for(self, stage: str) -> str:
+        """Модель для этапа — нужна только бэкенду по ключу."""
+        return self.model_stage2 if stage == "stage2" else self.model_stage1
+
     def validate(self) -> list[str]:
-        """Возвращает список проблем конфига (пустой список = всё ок)."""
+        """Фатальные проблемы конфига (пустой список = можно стартовать).
+
+        Отсутствие ключа фатальным не считается: аккаунты нейросети добавляются
+        через бота уже на ходу, и ради этого бот должен подняться.
+        """
         problems: list[str] = []
         if not self.bot_token:
             problems.append("BOT_TOKEN не задан (получи токен у @BotFather)")
-        if not self.llm_key:
-            problems.append("LLM_API_KEY / AITUNNEL_KEY не задан — без него нечем проверять сообщения")
+        if self.llm_backend not in ("auto", "key", "accounts"):
+            problems.append("LLM_BACKEND должен быть auto, key или accounts")
         if self.batch_size < 1:
             problems.append("BATCH_SIZE должен быть >= 1")
         if self.batch_timeout < 5:

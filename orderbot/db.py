@@ -48,6 +48,19 @@ CREATE TABLE IF NOT EXISTS hits (
     created_at  INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS llm_accounts (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    provider       TEXT NOT NULL,
+    email          TEXT NOT NULL,
+    password       TEXT NOT NULL,
+    added_at       INTEGER NOT NULL,
+    disabled       INTEGER NOT NULL DEFAULT 0,
+    cooldown_until INTEGER NOT NULL DEFAULT 0,
+    last_error     TEXT NOT NULL DEFAULT '',
+    uses           INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(provider, email)
+);
+
 CREATE TABLE IF NOT EXISTS stats (
     day     TEXT NOT NULL,
     metric  TEXT NOT NULL,
@@ -200,6 +213,67 @@ class Database:
     async def get_hit(self, hit_id: int) -> aiosqlite.Row | None:
         async with self.db.execute("SELECT * FROM hits WHERE id = ?", (hit_id,)) as cur:
             return await cur.fetchone()
+
+    # -------------------------------------------------------------- аккаунты LLM
+
+    async def llm_account_add(self, provider: str, email: str, password: str) -> int:
+        cur = await self.db.execute(
+            "INSERT INTO llm_accounts(provider, email, password, added_at) "
+            "VALUES(?, ?, ?, ?) ON CONFLICT(provider, email) DO UPDATE SET "
+            "password = excluded.password, disabled = 0, cooldown_until = 0, last_error = ''",
+            (provider, email, password, now()),
+        )
+        await self.db.commit()
+        if cur.lastrowid:
+            return int(cur.lastrowid)
+        async with self.db.execute(
+            "SELECT id FROM llm_accounts WHERE provider = ? AND email = ?",
+            (provider, email),
+        ) as c:
+            row = await c.fetchone()
+        return int(row["id"]) if row else 0
+
+    async def llm_accounts(self) -> list[aiosqlite.Row]:
+        async with self.db.execute(
+            "SELECT * FROM llm_accounts ORDER BY added_at"
+        ) as cur:
+            return list(await cur.fetchall())
+
+    async def llm_account(self, account_id: int) -> aiosqlite.Row | None:
+        async with self.db.execute(
+            "SELECT * FROM llm_accounts WHERE id = ?", (account_id,)
+        ) as cur:
+            return await cur.fetchone()
+
+    async def llm_account_delete(self, account_id: int) -> bool:
+        cur = await self.db.execute("DELETE FROM llm_accounts WHERE id = ?", (account_id,))
+        await self.db.commit()
+        return cur.rowcount > 0
+
+    async def llm_account_toggle(self, account_id: int) -> bool:
+        """Включает/выключает аккаунт. Возвращает новое состояние disabled."""
+        await self.db.execute(
+            "UPDATE llm_accounts SET disabled = 1 - disabled, cooldown_until = 0 "
+            "WHERE id = ?", (account_id,),
+        )
+        await self.db.commit()
+        row = await self.llm_account(account_id)
+        return bool(row["disabled"]) if row else False
+
+    async def llm_account_fail(self, account_id: int, cooldown_until: int,
+                               error: str) -> None:
+        await self.db.execute(
+            "UPDATE llm_accounts SET cooldown_until = ?, last_error = ? WHERE id = ?",
+            (cooldown_until, error, account_id),
+        )
+        await self.db.commit()
+
+    async def llm_account_used(self, account_id: int) -> None:
+        await self.db.execute(
+            "UPDATE llm_accounts SET uses = uses + 1, last_error = '', cooldown_until = 0 "
+            "WHERE id = ?", (account_id,),
+        )
+        await self.db.commit()
 
     # --------------------------------------------------------------------- stats
 
