@@ -16,7 +16,16 @@ from .utils import esc, log, truncate
 CATEGORY_LABELS = {
     "order": "разовый заказ",
     "vacancy": "вакансия",
+    "softbot": "ищет готовый софт",
     "other": "прочее",
+}
+
+# Заголовок зависит от того, что это за лид: заказ на разработку или
+# запрос «где взять готовое» — реагировать на них надо по-разному.
+CATEGORY_HEADERS = {
+    "order": "💼 <b>Найден заказ</b>",
+    "vacancy": "💼 <b>Вакансия</b>",
+    "softbot": "🤖 <b>Ищут готовый софт</b>",
 }
 
 MAX_MESSAGE_CHARS = 2800
@@ -39,8 +48,8 @@ def render(cand: Candidate, verdict: Verdict) -> str:
     percent = int(round(verdict.confidence * 100))
     category = CATEGORY_LABELS.get(verdict.category, verdict.category or "заказ")
 
-    head = f"💼 <b>Найден заказ</b> · {percent}%"
-    lines = [head, f"🏷 {esc(category)}"]
+    head = CATEGORY_HEADERS.get(verdict.category, "💼 <b>Найден заказ</b>")
+    lines = [f"{head} · {percent}%", f"🏷 {esc(category)}"]
     if verdict.stack:
         lines.append(f"🛠 {esc(truncate(verdict.stack, 200))}")
     if verdict.budget:

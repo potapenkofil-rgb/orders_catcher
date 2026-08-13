@@ -6,7 +6,7 @@ import asyncio
 import time
 
 from .buffer import BatchBuffer
-from .classifier import Classifier
+from .classifier import SHORT_LEAD_RE, Classifier
 from .config import Config
 from .dedup import DedupIndex
 from .models import Candidate, Verdict
@@ -55,9 +55,11 @@ class Pipeline:
             return
 
         text = (cand.text or "").strip()
-        if len(text) < self.cfg.min_text_len:
-            return
         if text.startswith("/"):                       # команды ботов
+            return
+        # Короткие лиды («ищу бота для рассылки» — 21 символ) не проходят по длине,
+        # хотя это самые чистые заявки. Для них исключение из порога.
+        if len(text) < self.cfg.min_text_len and not SHORT_LEAD_RE.search(text):
             return
 
         # Дубликаты режем до LLM: одно объявление часто висит в десятке чатов.

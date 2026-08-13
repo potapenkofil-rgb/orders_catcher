@@ -44,9 +44,12 @@ def _float(name: str, default: float) -> float:
 
 DEFAULT_PROFILE = (
     "IT-фрилансер широкого профиля. Пишу код на любом языке и стеке: "
-    "телеграм-боты, парсеры и скрейперы, автоматизация, бэкенд и API, "
+    "телеграм-боты и юзерботы, парсеры и скрейперы, автоматизация, бэкенд и API, "
     "веб-сайты и лендинги, десктоп-утилиты, интеграции, работа с данными, "
-    "ML/AI-обвязки, доработка и починка чужого кода."
+    "ML/AI-обвязки, доработка и починка чужого кода. "
+    "Отдельно делаю и продаю готовый телеграм-софт: рассылка по группам и в ЛС, "
+    "инвайтинг, отметки в историях, парсер участников чатов, поиск чатов, "
+    "ловец крипточеков, мониторинг чатов, автоответчик."
 )
 
 
@@ -64,6 +67,8 @@ class Config:
     llm_timeout: float
     stage1_chunk: int          # сколько сообщений в одном промпте на 1-м этапе
     stage2_concurrency: int    # сколько параллельных проверок на 2-м этапе
+    chat_ttl: float            # сколько живёт один чат с моделью (у каждого этапа свой)
+    chat_history_turns: int    # сколько прошлых обменов тащим в следующий запрос
 
     # --- Логика батчинга ---
     batch_size: int            # 100 сообщений
@@ -98,6 +103,8 @@ class Config:
             llm_timeout=_float("LLM_TIMEOUT", 90.0),
             stage1_chunk=_int("STAGE1_CHUNK", 25),
             stage2_concurrency=_int("STAGE2_CONCURRENCY", 4),
+            chat_ttl=_float("CHAT_TTL_HOURS", 6.0) * 3600,
+            chat_history_turns=_int("CHAT_HISTORY_TURNS", 1),
             batch_size=_int("BATCH_SIZE", 100),
             batch_timeout=_float("BATCH_TIMEOUT", 300.0),
             min_confidence=_float("MIN_CONFIDENCE", 0.65),
@@ -121,4 +128,6 @@ class Config:
             problems.append("BATCH_SIZE должен быть >= 1")
         if self.batch_timeout < 5:
             problems.append("BATCH_TIMEOUT должен быть >= 5 секунд")
+        if self.chat_ttl < 60:
+            problems.append("CHAT_TTL_HOURS слишком мал — минимум 0.02 (около минуты)")
         return problems

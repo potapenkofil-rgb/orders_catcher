@@ -282,6 +282,9 @@ async def cmd_status(message: Message, deps: Deps) -> None:
     lines.append(f"🚫 В ЧС: {len(rt.banned_users)} польз., {len(rt.banned_chats)} чатов")
     lines.append(f"🎯 Порог уверенности: {rt.min_confidence:.2f}")
     lines.append(f"🧠 Модели: {esc(deps.cfg.model_stage1)} → {esc(deps.cfg.model_stage2)}")
+    lines.append(f"💬 Чат этапа 1: {esc(deps.classifier.chat1.info())}")
+    lines.append(f"💬 Чат этапа 2: {esc(deps.classifier.chat2.info())}")
+    lines.append(f"🔄 Смена чатов: раз в {deps.cfg.chat_ttl / 3600:.0f} ч")
     lines.append(f"🧾 Помню сообщений (антидубль): {deps.dedup.size}")
     if deps.classifier.last_error:
         lines.append(f"\n⚠️ Последняя ошибка LLM: {esc(truncate(deps.classifier.last_error, 200))}")
