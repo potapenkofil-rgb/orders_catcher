@@ -19,6 +19,7 @@ class Candidate:
     author_name: str = ""
     author_username: str | None = None
     is_channel: bool = False
+    via: str = ""              # через какой телеграм-аккаунт увидено
 
     @property
     def key(self) -> str:

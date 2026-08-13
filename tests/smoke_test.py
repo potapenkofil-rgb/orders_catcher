@@ -24,6 +24,7 @@ from orderbot.models import Candidate, Verdict
 from orderbot.notifier import build_keyboard, render
 from orderbot.pipeline import Pipeline
 from orderbot.state import Runtime
+from orderbot.userbot import TgAccount, UserBot, UserBotManager
 
 ok = 0
 fail = 0
@@ -217,6 +218,10 @@ def test_render():
     check("экранирование html", "&lt;b&gt;" in text and "&amp;" in text)
     check("процент уверенности", "87%" in text)
     check("автор и чат", "Иван" in text and "@ivan" in text and "Фриланс IT" in text)
+    with_via = cand("Ищу разработчика")
+    with_via.via = "Рабочий (@work_acc)"
+    check("в уведомлении видно, через какой аккаунт поймано",
+          "Рабочий (@work_acc)" in render(with_via, v))
     check("длина влезает в лимит телеграма", len(render(cand("я" * 9000), v)) < 4096)
 
     kb = build_keyboard(5, c.link, True)
@@ -673,6 +678,20 @@ async def test_pipeline(tmp):
     await pipe.ingest(cand("продам софт для рассылки", msg_id=32, author_id=32))
     check("короткая реклама продавца не проходит", pipe.buffer.pending == 2)
 
+    same_ad = ("Требуется специалист на разовую задачу: настроить выгрузку заказов "
+               "из амоCRM в гугл-таблицы, оплата по договорённости, детали в личку.")
+    first = cand(same_ad, msg_id=40, author_id=40)
+    first.via = "Первый аккаунт"
+    second = cand(same_ad, msg_id=40, author_id=40)
+    second.via = "Второй аккаунт"
+    pending_before = pipe.buffer.pending
+    await pipe.ingest(first)
+    check("сообщение из общего чата принято один раз",
+          pipe.buffer.pending == pending_before + 1)
+    await pipe.ingest(second)
+    check("второй аккаунт то же сообщение не дублирует",
+          pipe.buffer.pending == pending_before + 1)
+
     batch = [
         cand("Ищу на заказ разработчика бота, бюджет 20к", msg_id=10, author_id=1),
         cand("Всем доброе утро, как дела у всех сегодня в этом чате", msg_id=11, author_id=2),
@@ -692,7 +711,9 @@ async def test_pipeline(tmp):
     check("падение этапа 2 не роняет батч", 15 not in sent_ids)
 
     stats = await db.stats_today()
-    check("статистика дублей", stats.get("skipped_duplicate") == 1, f"({stats})")
+    # один дубль по тексту (то же объявление в другом чате) + один по id сообщения
+    # (тот же пост, увиденный вторым аккаунтом)
+    check("статистика дублей", stats.get("skipped_duplicate") == 2, f"({stats})")
     check("статистика ЧС", stats.get("skipped_blacklist") == 2, f"({stats})")
     check("статистика отправок", stats.get("sent") == 3, f"({stats})")
 
@@ -703,6 +724,57 @@ async def test_pipeline(tmp):
 
     await pipe.process_batch([])
     check("пустой батч безопасен", clf.stage1_calls == 2, f"({clf.stage1_calls})")
+
+
+async def test_tg_accounts(tmp):
+    print("\n[телеграм-аккаунты]")
+    db = await open_db(Path(tmp) / "tg.db")
+    cfg = Config.load()
+
+    async def noop(cand):
+        return None
+
+    # старая одноаккаунтная схема переезжает в таблицу
+    await db.set("session", "OLD-SESSION")
+    await db.set("api_id", 111)
+    await db.set("api_hash", "oldhash")
+    manager = UserBotManager(cfg, db, noop)
+    await manager.load()
+    check("старая сессия перенесена в мультиаккаунт", len(manager.accounts) == 1)
+    check("старые ключи стёрты", await db.get("session") is None)
+
+    await db.tg_account_add(1, "h1", "+79990000001", "sess1", "Иван", "ivan", 1001)
+    await db.tg_account_add(2, "h2", "+79990000002", "sess2", "Пётр", "", 1002)
+    await manager.load()
+    check("аккаунты подхватились", len(manager.accounts) == 3, f"({len(manager.accounts)})")
+    titles = [a.title for a in manager.accounts]
+    check("подпись с юзернеймом", "Иван (@ivan)" in titles, f"({titles})")
+    check("подпись без юзернейма", "Пётр" in titles, f"({titles})")
+
+    await db.tg_account_add(1, "h1", "+79990000001", "sess1-new", "Иван", "ivan", 1001)
+    rows = await db.tg_accounts()
+    check("повторный вход тем же аккаунтом не плодит запись", len(rows) == 3, f"({len(rows)})")
+    check("сессия обновилась", any(r["session"] == "sess1-new" for r in rows))
+
+    ivan = next(a for a in manager.accounts if a.username == "ivan")
+    check("выключение аккаунта", await manager.toggle(ivan.id) is True)
+    check("выключенный не стартует", await manager.get(ivan.id).start() is False)
+    await manager.load()
+    check("выключение переживает рестарт",
+          next(a for a in manager.accounts if a.username == "ivan").disabled is True)
+
+    check("удаление аккаунта", await manager.remove(ivan.id) is True)
+    await manager.load()
+    check("удалённого нет ни в базе, ни в памяти",
+          len(manager.accounts) == 2 and manager.get(ivan.id) is None)
+
+    check("без клиентов ничего не слушает", manager.is_running is False)
+    check("битая сессия не роняет запуск", await manager.start_all() == 0)
+    dead = next(a for a in manager.accounts if a.session == "sess2")
+    check("причина записана", bool(dead.last_error), f"({dead.last_error})")
+
+    bot = UserBot(TgAccount(id=99, api_id=1, api_hash="h", session=""), noop)
+    check("аккаунт без сессии не стартует", await bot.start() is False)
 
 
 async def test_state(tmp):
@@ -738,7 +810,7 @@ async def test_dispatcher(tmp):
     from orderbot.bot import HELP, Deps, build_dispatcher
     from orderbot.llm import build_router
     from orderbot.notifier import Notifier
-    from orderbot.userbot import UserBot
+    from orderbot.userbot import UserBotManager
 
     db = await open_db(Path(tmp) / "b.db")
     cfg = Config.load()
@@ -750,15 +822,15 @@ async def test_dispatcher(tmp):
     dedup = DedupIndex(db, 7, 12)
     notifier = Notifier(bot, db, rt)
     pipe = Pipeline(cfg, rt, dedup, clf, notifier)
-    ub = UserBot(cfg, db, pipe.ingest)
+    ub = UserBotManager(cfg, db, pipe.ingest)
     dp = build_dispatcher(Deps(cfg=cfg, db=db, runtime=rt, userbot=ub, pipeline=pipe,
                                classifier=clf, dedup=dedup, router=llm))
     check("диспетчер собран", dp is not None)
     check("deps проброшены в хендлеры", dp["deps"] is not None)
     check("help перечисляет команды",
           all(c in HELP for c in ["/login", "/status", "/bl", "/threshold", "/test",
-                                  "/chats", "/accounts", "/addaccount"]))
-    check("юзербот пока не запущен", ub.is_running is False)
+                                  "/chats", "/accounts", "/llm", "/addllm"]))
+    check("юзерботы пока не запущены", ub.is_running is False)
     await clf.close()
     await bot.session.close()
 
@@ -777,6 +849,7 @@ async def main():
             await test_accounts_backend(tmp)
             await test_classifier()
             await test_pipeline(tmp)
+            await test_tg_accounts(tmp)
             await test_state(tmp)
             await test_dispatcher(tmp)
     finally:

@@ -48,6 +48,20 @@ CREATE TABLE IF NOT EXISTS hits (
     created_at  INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS tg_accounts (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    api_id     INTEGER NOT NULL,
+    api_hash   TEXT NOT NULL,
+    phone      TEXT NOT NULL DEFAULT '',
+    session    TEXT NOT NULL,
+    label      TEXT NOT NULL DEFAULT '',
+    username   TEXT NOT NULL DEFAULT '',
+    user_id    INTEGER UNIQUE,
+    disabled   INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT NOT NULL DEFAULT '',
+    added_at   INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS llm_accounts (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     provider       TEXT NOT NULL,
@@ -213,6 +227,58 @@ class Database:
     async def get_hit(self, hit_id: int) -> aiosqlite.Row | None:
         async with self.db.execute("SELECT * FROM hits WHERE id = ?", (hit_id,)) as cur:
             return await cur.fetchone()
+
+    # --------------------------------------------------------- телеграм-аккаунты
+
+    async def tg_account_add(self, api_id: int, api_hash: str, phone: str,
+                             session: str, label: str, username: str,
+                             user_id: int | None) -> int:
+        """Добавляет или обновляет аккаунт. Ключ — user_id, повторно не заведётся."""
+        cur = await self.db.execute(
+            "INSERT INTO tg_accounts(api_id, api_hash, phone, session, label, "
+            "username, user_id, added_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET api_id = excluded.api_id, "
+            "api_hash = excluded.api_hash, phone = excluded.phone, "
+            "session = excluded.session, label = excluded.label, "
+            "username = excluded.username, disabled = 0, last_error = ''",
+            (api_id, api_hash, phone, session, label, username, user_id, now()),
+        )
+        await self.db.commit()
+        if cur.lastrowid:
+            return int(cur.lastrowid)
+        async with self.db.execute(
+            "SELECT id FROM tg_accounts WHERE user_id = ?", (user_id,)
+        ) as c:
+            row = await c.fetchone()
+        return int(row["id"]) if row else 0
+
+    async def tg_accounts(self) -> list[aiosqlite.Row]:
+        async with self.db.execute(
+            "SELECT * FROM tg_accounts ORDER BY added_at"
+        ) as cur:
+            return list(await cur.fetchall())
+
+    async def tg_account_delete(self, account_id: int) -> bool:
+        cur = await self.db.execute("DELETE FROM tg_accounts WHERE id = ?", (account_id,))
+        await self.db.commit()
+        return cur.rowcount > 0
+
+    async def tg_account_toggle(self, account_id: int) -> bool:
+        await self.db.execute(
+            "UPDATE tg_accounts SET disabled = 1 - disabled WHERE id = ?", (account_id,)
+        )
+        await self.db.commit()
+        async with self.db.execute(
+            "SELECT disabled FROM tg_accounts WHERE id = ?", (account_id,)
+        ) as cur:
+            row = await cur.fetchone()
+        return bool(row["disabled"]) if row else False
+
+    async def tg_account_error(self, account_id: int, error: str) -> None:
+        await self.db.execute(
+            "UPDATE tg_accounts SET last_error = ? WHERE id = ?", (error, account_id)
+        )
+        await self.db.commit()
 
     # -------------------------------------------------------------- аккаунты LLM
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections import deque
 
 from .buffer import BatchBuffer
 from .classifier import SHORT_LEAD_RE, Classifier
@@ -34,6 +35,10 @@ class Pipeline:
         )
         self.last_batch_at: float = 0.0
         self.batches_done: int = 0
+        # Одно и то же сообщение видят все аккаунты, состоящие в чате, —
+        # режем по id сообщения, не доводя до текстового антидубля.
+        self._seen_keys: set[str] = set()
+        self._seen_order: deque[str] = deque()
 
     def start(self) -> None:
         self.buffer.start()
@@ -54,6 +59,10 @@ class Pipeline:
             await db.bump("skipped_blacklist")
             return
 
+        if not self._first_time(cand.key):
+            await db.bump("skipped_duplicate")
+            return
+
         text = (cand.text or "").strip()
         if text.startswith("/"):                       # команды ботов
             return
@@ -69,6 +78,17 @@ class Pipeline:
 
         await db.bump("queued")
         self.buffer.add(cand)
+
+    def _first_time(self, key: str, limit: int = 20000) -> bool:
+        """True — это сообщение ещё не приходило ни от одного аккаунта."""
+        if key in self._seen_keys:
+            return False
+        self._seen_keys.add(key)
+        self._seen_order.append(key)
+        if len(self._seen_order) > limit:
+            for _ in range(limit // 4):
+                self._seen_keys.discard(self._seen_order.popleft())
+        return True
 
     # ------------------------------------------------------------------ обработка батча
 

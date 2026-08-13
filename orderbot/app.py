@@ -18,7 +18,7 @@ from .llm import build_router
 from .notifier import Notifier
 from .pipeline import Pipeline
 from .state import Runtime
-from .userbot import UserBot
+from .userbot import UserBotManager
 from .utils import log, setup_logging
 
 CLEANUP_INTERVAL = 6 * 3600
@@ -67,7 +67,8 @@ async def run() -> None:
     bot = Bot(cfg.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     notifier = Notifier(bot, db, runtime)
     pipeline = Pipeline(cfg, runtime, dedup, classifier, notifier)
-    userbot = UserBot(cfg, db, pipeline.ingest)
+    userbot = UserBotManager(cfg, db, pipeline.ingest)
+    await userbot.load()
 
     deps = Deps(
         cfg=cfg,
@@ -93,18 +94,23 @@ async def run() -> None:
                 "LLM_API_KEY в .env. Пока лиды искаться не будут."
             )
 
-    if await userbot.try_start_saved():
-        account = userbot.account
-        log.info("Сессия восстановлена: %s", account.name if account else "?")
+    started = await userbot.start_all()
+    total = len(userbot.accounts)
+    if started:
+        log.info("Подняты телеграм-аккаунты: %s из %s", started, total)
+        if runtime.owner_id:
+            note = f"♻️ Перезапустился, слушаю чаты. Аккаунтов на связи: {started}"
+            if started < total:
+                note += f" из {total} — остальные не поднялись, посмотри /accounts"
+            if runtime.paused:
+                note += "\nСейчас на паузе — /resume"
+            await notifier.send_text(note)
+    else:
+        log.warning("Ни одного телеграм-аккаунта — залогинься через бота: /login")
         if runtime.owner_id:
             await notifier.send_text(
-                "♻️ Перезапустился и слушаю чаты дальше."
-                + (" Сейчас на паузе — /resume" if runtime.paused else "")
+                "♻️ Перезапустился. Телеграм-аккаунтов нет — подключи через /login"
             )
-    else:
-        log.warning("Аккаунт не подключён — залогинься через бота: /login")
-        if runtime.owner_id:
-            await notifier.send_text("♻️ Перезапустился. Аккаунт не подключён — /login")
 
     try:
         await dp.start_polling(bot, handle_signals=True)
@@ -117,7 +123,7 @@ async def run() -> None:
         cleanup_task.cancel()
         await asyncio.gather(cleanup_task, return_exceptions=True)
         await pipeline.stop()
-        await userbot.stop()
+        await userbot.stop_all()
         await classifier.close()
         await db.close()
         await bot.session.close()

@@ -26,7 +26,7 @@ from .llm import PROVIDER_TITLES, PROVIDERS, LLMError, LLMRouter
 from .models import Candidate
 from .pipeline import Pipeline
 from .state import Runtime
-from .userbot import LoginError, UserBot
+from .userbot import LoginError, TgAccount, UserBotManager
 from .utils import esc, human_ts, log, now, truncate
 
 DIGITS_RE = re.compile(r"\D+")
@@ -37,14 +37,14 @@ HELP = """<b>Ловец заказов</b>
 Проверка в два этапа: сначала пачка сообщений (100 штук или 5 минут — что раньше),
 потом каждое выжившее сообщение проверяется отдельно.
 
-<b>Аккаунт</b>
-/login — войти в аккаунт (api_id, api_hash, телефон, код, 2FA)
-/logout — выйти и стереть сессию
+<b>Телеграм-аккаунты</b> (можно несколько)
+/login — подключить ещё один аккаунт (api_id, api_hash, телефон, код, 2FA)
+/accounts — список аккаунтов: включить, выключить, отключить
 /chats — какие чаты и каналы слушаю
 
 <b>Аккаунты нейросети</b>
-/accounts — список аккаунтов, включить/выключить/удалить
-/addaccount — добавить аккаунт (DeepSeek или Qwen) по email и паролю
+/llm — список аккаунтов, включить/выключить/удалить
+/addllm — добавить аккаунт (DeepSeek или Qwen) по email и паролю
 
 <b>Управление</b>
 /status — что происходит прямо сейчас
@@ -68,7 +68,7 @@ class Deps:
     cfg: Config
     db: Database
     runtime: Runtime
-    userbot: UserBot
+    userbot: UserBotManager
     pipeline: Pipeline
     classifier: Classifier
     dedup: DedupIndex
@@ -132,8 +132,8 @@ async def _quiet_delete(message: Message) -> None:
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, deps: Deps) -> None:
-    running = deps.userbot.is_running
-    hint = "" if running else "\n\n⚠️ Аккаунт не подключён — начни с /login"
+    hint = ("" if deps.userbot.is_running
+            else "\n\n⚠️ Телеграм-аккаунтов нет — начни с /login")
     await message.answer(HELP + hint)
 
 
@@ -154,10 +154,14 @@ async def cmd_cancel(message: Message, state: FSMContext) -> None:
 # ----------------------------------------------------------------------------- логин
 
 @router.message(Command("login"))
-async def cmd_login(message: Message, state: FSMContext) -> None:
+async def cmd_login(message: Message, state: FSMContext, deps: Deps) -> None:
     await state.set_state(Login.api_id)
+    already = len(deps.userbot.accounts)
+    prefix = (f"Сейчас подключено аккаунтов: {already}. Добавляю ещё один.\n\n"
+              if already else "")
     await message.answer(
-        "<b>Шаг 1 из 4.</b> Пришли <code>api_id</code>.\n\n"
+        prefix
+        + "<b>Шаг 1 из 4.</b> Пришли <code>api_id</code>.\n\n"
         "Взять тут: my.telegram.org → API development tools. "
         "Это число вроде <code>1234567</code>.\n\n"
         "Отменить — /cancel"
@@ -224,13 +228,13 @@ async def login_code(message: Message, state: FSMContext, deps: Deps) -> None:
         return
     await _quiet_delete(message)
     try:
-        done = await deps.userbot.submit_code(code)
+        account = await deps.userbot.submit_code(code)
     except LoginError as exc:
         await message.answer(f"❌ {esc(str(exc))}")
         return
-    if done:
+    if account is not None:
         await state.clear()
-        await _login_success(message, deps)
+        await _login_success(message, deps, account)
         return
     await state.set_state(Login.password)
     await message.answer("🔐 Включена двухфакторка. Пришли облачный пароль.")
@@ -244,31 +248,94 @@ async def login_password(message: Message, state: FSMContext, deps: Deps) -> Non
         await message.answer("Пустой пароль. Попробуй ещё раз или /cancel")
         return
     try:
-        await deps.userbot.submit_password(password)
+        account = await deps.userbot.submit_password(password)
     except LoginError as exc:
         await message.answer(f"❌ {esc(str(exc))}")
         return
     await state.clear()
-    await _login_success(message, deps)
+    await _login_success(message, deps, account)
 
 
-async def _login_success(message: Message, deps: Deps) -> None:
-    account = deps.userbot.account
-    who = f"{account.name} (@{account.username})" if account else "аккаунт"
+async def _login_success(message: Message, deps: Deps, account: TgAccount) -> None:
+    total = len(deps.userbot.accounts)
     await message.answer(
-        f"✅ Вошёл как <b>{esc(who)}</b>.\n\n"
-        "Слушаю все группы и каналы. Как только найду заказ — пришлю сюда.\n"
-        "Посмотреть источники: /chats"
+        f"✅ Вошёл как <b>{esc(account.title)}</b>.\n"
+        f"Всего аккаунтов на связи: {total}.\n\n"
+        "Слушаю все их группы и каналы. Одно и то же сообщение из общего чата "
+        "придёт один раз.\n\n"
+        "Подключить ещё — /login, список — /accounts, источники — /chats"
     )
+
+
+def _tg_keyboard(account: TgAccount) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text="▶️ Включить" if account.disabled else "⏸ Выключить",
+            callback_data=f"tg_toggle:{account.id}",
+        ),
+        InlineKeyboardButton(text="🚪 Отключить", callback_data=f"tg_del:{account.id}"),
+    ]])
+
+
+def _tg_state(deps: Deps, account: TgAccount) -> str:
+    bot = deps.userbot.get(account.id)
+    if account.disabled:
+        return "⛔ выключен"
+    if bot is not None and bot.is_running:
+        return "✅ слушает чаты"
+    error = f": {truncate(account.last_error, 60)}" if account.last_error else ""
+    return f"⚠️ не на связи{error}"
+
+
+@router.message(Command("accounts"))
+async def cmd_tg_accounts(message: Message, deps: Deps) -> None:
+    accounts = deps.userbot.accounts
+    if not accounts:
+        await message.answer("Телеграм-аккаунтов нет. Подключить — /login")
+        return
+    await message.answer(f"<b>Телеграм-аккаунты ({len(accounts)})</b>")
+    for account in accounts:
+        await message.answer(
+            f"<b>{esc(account.title)}</b>\n{esc(_tg_state(deps, account))}",
+            reply_markup=_tg_keyboard(account),
+        )
 
 
 @router.message(Command("logout"))
 async def cmd_logout(message: Message, deps: Deps) -> None:
-    if not deps.userbot.is_running:
-        await message.answer("Аккаунт и так не подключён.")
+    if not deps.userbot.accounts:
+        await message.answer("Аккаунтов и так нет.")
         return
-    await deps.userbot.logout()
-    await message.answer("Вышел из аккаунта, сессия стёрта. Заново — /login")
+    await message.answer("Отключить можно любой — кнопкой «🚪 Отключить» под ним:")
+    await cmd_tg_accounts(message, deps)
+
+
+@router.callback_query(F.data.startswith("tg_del:"))
+async def cb_tg_delete(call: CallbackQuery, deps: Deps) -> None:
+    account_id = int(call.data.split(":", 1)[1])
+    await deps.userbot.remove(account_id)
+    await call.answer("Отключил, сессия стёрта")
+    try:
+        await call.message.edit_text(f"{call.message.html_text}\n\n🚪 Отключён")
+    except Exception:                                     # noqa: BLE001
+        pass
+
+
+@router.callback_query(F.data.startswith("tg_toggle:"))
+async def cb_tg_toggle(call: CallbackQuery, deps: Deps) -> None:
+    account_id = int(call.data.split(":", 1)[1])
+    disabled = await deps.userbot.toggle(account_id)
+    await call.answer("Выключил" if disabled else "Включил")
+    bot = deps.userbot.get(account_id)
+    if bot is None:
+        return
+    try:
+        await call.message.edit_text(
+            f"<b>{esc(bot.account.title)}</b>\n{esc(_tg_state(deps, bot.account))}",
+            reply_markup=_tg_keyboard(bot.account),
+        )
+    except Exception:                                     # noqa: BLE001
+        pass
 
 
 # ---------------------------------------------------------------------------- статус
@@ -276,12 +343,19 @@ async def cmd_logout(message: Message, deps: Deps) -> None:
 @router.message(Command("status"))
 async def cmd_status(message: Message, deps: Deps) -> None:
     rt = deps.runtime
-    account = deps.userbot.account
+    accounts = deps.userbot.accounts
+    running = deps.userbot.running
     lines = ["<b>Статус</b>", ""]
-    if deps.userbot.is_running and account:
-        lines.append(f"✅ Аккаунт: {esc(account.name)} (@{account.username or '—'})")
+    if running:
+        lines.append(f"✅ Телеграм-аккаунтов на связи: {len(running)} из {len(accounts)}")
+        for bot in running[:5]:
+            lines.append(f"   • {esc(bot.account.title)}")
+        if len(running) > 5:
+            lines.append(f"   • …и ещё {len(running) - 5}")
+    elif accounts:
+        lines.append(f"⚠️ Ни один из {len(accounts)} аккаунтов не на связи — /accounts")
     else:
-        lines.append("❌ Аккаунт не подключён — /login")
+        lines.append("❌ Телеграм-аккаунтов нет — /login")
     lines.append(f"{'⏸ На паузе' if rt.paused else '▶️ Слушаю чаты'}")
     lines.append("")
     lines.append(f"📦 В буфере: {deps.pipeline.buffer.pending} из {deps.cfg.batch_size}")
@@ -342,18 +416,27 @@ async def cmd_stats(message: Message, deps: Deps) -> None:
 @router.message(Command("chats"))
 async def cmd_chats(message: Message, deps: Deps) -> None:
     if not deps.userbot.is_running:
-        await message.answer("Аккаунт не подключён — /login")
+        await message.answer("Ни один телеграм-аккаунт не на связи — /login")
         return
     await message.answer("Собираю список…")
-    sources = await deps.userbot.list_sources()
-    if not sources:
+    per_account = await deps.userbot.list_sources()
+    banned = deps.runtime.banned_chats
+    seen: set[int] = set()
+    lines: list[str] = []
+    for account, sources in per_account:
+        lines.append(f"<b>{esc(account.title)} — {len(sources)}</b>")
+        for title, chat_id, kind in sources:
+            mark = "🚫 " if chat_id in banned else ("↺ " if chat_id in seen else "")
+            seen.add(chat_id)
+            lines.append(f"{mark}{esc(truncate(title, 45))} · <i>{kind}</i> · "
+                         f"<code>{chat_id}</code>")
+        lines.append("")
+    if not seen:
         await message.answer("Ни групп, ни каналов не нашёл.")
         return
-    banned = deps.runtime.banned_chats
-    lines = [f"<b>Источников: {len(sources)}</b>", ""]
-    for title, chat_id, kind in sources:
-        mark = "🚫 " if chat_id in banned else ""
-        lines.append(f"{mark}{esc(truncate(title, 45))} · <i>{kind}</i> · <code>{chat_id}</code>")
+    lines.insert(0, f"<b>Уникальных источников: {len(seen)}</b> "
+                    "(↺ — чат виден и другому аккаунту)")
+    lines.insert(1, "")
     await _send_chunks(message, lines)
 
 
@@ -437,24 +520,24 @@ async def cmd_test(message: Message, command: CommandObject, deps: Deps) -> None
 
 # ------------------------------------------------------------- аккаунты нейросети
 
-def _accounts_keyboard(account) -> InlineKeyboardMarkup:
+def _llm_keyboard(account) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(
             text="▶️ Включить" if account.disabled else "⏸ Выключить",
-            callback_data=f"acc_toggle:{account.id}",
+            callback_data=f"llm_toggle:{account.id}",
         ),
-        InlineKeyboardButton(text="🗑 Удалить", callback_data=f"acc_del:{account.id}"),
+        InlineKeyboardButton(text="🗑 Удалить", callback_data=f"llm_del:{account.id}"),
     ]])
 
 
-@router.message(Command("accounts"))
-async def cmd_accounts(message: Message, deps: Deps) -> None:
+@router.message(Command("llm"))
+async def cmd_llm_accounts(message: Message, deps: Deps) -> None:
     await deps.router.accounts.reload()
     accounts = deps.router.accounts.accounts
     if not accounts:
         await message.answer(
             "Аккаунтов нейросети нет.\n\n"
-            "Добавить: /addaccount — понадобится email и пароль от аккаунта "
+            "Добавить: /addllm — понадобится email и пароль от аккаунта "
             "DeepSeek или Qwen.\n"
             + ("Пока проверяю по ключу из .env." if deps.cfg.llm_key
                else "Ключа в .env тоже нет — проверять сообщения сейчас нечем.")
@@ -464,14 +547,14 @@ async def cmd_accounts(message: Message, deps: Deps) -> None:
     for account in accounts:
         await message.answer(
             f"<b>{esc(account.title)}</b> · {esc(account.email)}\n{esc(account.state())}",
-            reply_markup=_accounts_keyboard(account),
+            reply_markup=_llm_keyboard(account),
         )
 
 
-@router.message(Command("addaccount"))
-async def cmd_addaccount(message: Message, state: FSMContext) -> None:
+@router.message(Command("addllm"))
+async def cmd_addllm(message: Message, state: FSMContext) -> None:
     await state.set_state(AddAccount.provider)
-    buttons = [[InlineKeyboardButton(text=PROVIDER_TITLES[p], callback_data=f"acc_prov:{p}")]
+    buttons = [[InlineKeyboardButton(text=PROVIDER_TITLES[p], callback_data=f"llm_prov:{p}")]
                for p in PROVIDERS]
     await message.answer(
         "Какой аккаунт добавляем?\n\n"
@@ -481,7 +564,7 @@ async def cmd_addaccount(message: Message, state: FSMContext) -> None:
     )
 
 
-@router.callback_query(AddAccount.provider, F.data.startswith("acc_prov:"))
+@router.callback_query(AddAccount.provider, F.data.startswith("llm_prov:"))
 async def cb_account_provider(call: CallbackQuery, state: FSMContext) -> None:
     provider = call.data.split(":", 1)[1]
     if provider not in PROVIDERS:
@@ -522,7 +605,7 @@ async def add_account_password(message: Message, state: FSMContext, deps: Deps) 
     except LLMError as exc:
         await note.edit_text(
             f"❌ Не вышло: {esc(truncate(str(exc), 300))}\n\n"
-            "Проверь email и пароль. Попробовать снова — /addaccount"
+            "Проверь email и пароль. Попробовать снова — /addllm"
         )
         await state.clear()
         return
@@ -533,11 +616,11 @@ async def add_account_password(message: Message, state: FSMContext, deps: Deps) 
     await note.edit_text(
         f"✅ Аккаунт {esc(PROVIDER_TITLES[provider])} · {esc(email)} добавлен.\n"
         f"Ответ на проверочный вопрос: <i>{esc(truncate(answer, 100))}</i>\n\n"
-        "Теперь проверка сообщений идёт через него. Все аккаунты — /accounts"
+        "Теперь проверка сообщений идёт через него. Все аккаунты — /llm"
     )
 
 
-@router.callback_query(F.data.startswith("acc_del:"))
+@router.callback_query(F.data.startswith("llm_del:"))
 async def cb_account_delete(call: CallbackQuery, deps: Deps) -> None:
     account_id = int(call.data.split(":", 1)[1])
     deps.router.accounts.forget_client(account_id)
@@ -550,7 +633,7 @@ async def cb_account_delete(call: CallbackQuery, deps: Deps) -> None:
         pass
 
 
-@router.callback_query(F.data.startswith("acc_toggle:"))
+@router.callback_query(F.data.startswith("llm_toggle:"))
 async def cb_account_toggle(call: CallbackQuery, deps: Deps) -> None:
     account_id = int(call.data.split(":", 1)[1])
     disabled = await deps.db.llm_account_toggle(account_id)
@@ -562,7 +645,7 @@ async def cb_account_toggle(call: CallbackQuery, deps: Deps) -> None:
     try:
         await call.message.edit_text(
             f"<b>{esc(account.title)}</b> · {esc(account.email)}\n{esc(account.state())}",
-            reply_markup=_accounts_keyboard(account),
+            reply_markup=_llm_keyboard(account),
         )
     except Exception:                                     # noqa: BLE001
         pass

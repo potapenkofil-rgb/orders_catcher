@@ -57,6 +57,8 @@ def render(cand: Candidate, verdict: Verdict) -> str:
     lines.append("")
     lines.append(f"💬 <b>Чат:</b> {esc(truncate(cand.chat_title or str(cand.chat_id), 80))}")
     lines.append(f"👤 <b>Автор:</b> {esc(truncate(cand.author_label, 80))}")
+    if cand.via:
+        lines.append(f"📱 <b>Аккаунт:</b> {esc(truncate(cand.via, 60))}")
     if cand.author_id:
         lines.append(f"🆔 <code>{cand.author_id}</code>")
     lines.append("")
