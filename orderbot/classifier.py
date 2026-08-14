@@ -175,10 +175,16 @@ class Classifier:
             return
         if not (self.chat1.dirty or self.chat2.dirty):
             return
-        await self.db.set("chat_state", {
-            self.chat1.name: self.chat1.dump(),
-            self.chat2.name: self.chat2.dump(),
-        })
+        try:
+            await self.db.set("chat_state", {
+                self.chat1.name: self.chat1.dump(),
+                self.chat2.name: self.chat2.dump(),
+            })
+        except Exception as exc:                          # noqa: BLE001
+            # База может быть уже закрыта при выключении — это не повод падать
+            # в finally и прятать настоящую причину остановки.
+            log.debug("Состояние чатов не сохранилось: %s", exc)
+            return
         self.chat1.dirty = self.chat2.dirty = False
 
     async def close(self) -> None:
