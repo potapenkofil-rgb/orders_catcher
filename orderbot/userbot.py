@@ -44,6 +44,26 @@ class LoginError(Exception):
     """Ошибка на любом шаге авторизации — текст уже пригоден для показа юзеру."""
 
 
+# Куда Телеграм отправил код. Если аккаунт уже залогинен на телефоне, кода в SMS
+# не будет вообще — он придёт сообщением в сам Телеграм, в служебный чат.
+CODE_DESTINATIONS = {
+    "SentCodeTypeApp": "в приложение Telegram — служебный чат «Telegram» "
+                       "(с синей галочкой), не в SMS",
+    "SentCodeTypeSms": "по SMS на номер",
+    "SentCodeTypeCall": "звонком — код продиктует робот",
+    "SentCodeTypeFlashCall": "сбросом звонка — код в последних цифрах номера",
+    "SentCodeTypeMissedCall": "пропущенным звонком — код в последних цифрах номера",
+    "SentCodeTypeEmailCode": "на почту, привязанную к аккаунту",
+    "SentCodeTypeFragmentSms": "через Fragment (анонимный номер)",
+    "SentCodeTypeFirebaseSms": "по SMS на номер",
+}
+
+
+def _describe_code(sent) -> str:
+    kind = type(getattr(sent, "type", None)).__name__
+    return CODE_DESTINATIONS.get(kind, f"способом {kind or 'неизвестно каким'}")
+
+
 @dataclass
 class TgAccount:
     id: int
@@ -302,8 +322,8 @@ class UserBotManager:
         self._phone = ""
         self._code_hash = ""
 
-    async def start_login(self, api_id: int, api_hash: str, phone: str) -> None:
-        """Шаг 1: запрашивает код подтверждения на телефон."""
+    async def start_login(self, api_id: int, api_hash: str, phone: str) -> str:
+        """Шаг 1: запрашивает код. Возвращает описание, куда он ушёл."""
         await self._drop_pending()
         self._api = (api_id, api_hash)
         self._phone = phone
@@ -313,6 +333,7 @@ class UserBotManager:
             sent = await client.send_code_request(phone)
             self._code_hash = sent.phone_code_hash
             self._pending = client
+            return _describe_code(sent)
         except ApiIdInvalidError as exc:
             await client.disconnect()
             raise LoginError("Неверные api_id / api_hash. Проверь их на my.telegram.org") from exc
@@ -325,6 +346,51 @@ class UserBotManager:
         except Exception as exc:                          # noqa: BLE001
             await client.disconnect()
             raise LoginError(f"Не удалось запросить код: {exc}") from exc
+
+    async def add_by_session(self, api_id: int, api_hash: str, session: str) -> TgAccount:
+        """Подключить аккаунт готовой строкой сессии (tools/make_session.py).
+
+        Спасает, когда Телеграм не доставляет код на серверный IP: логинишься
+        дома, а сюда отдаёшь уже готовую сессию.
+        """
+        try:
+            client = TelegramClient(StringSession(session), api_id, api_hash, **DEVICE)
+        except ValueError as exc:
+            raise LoginError(f"Это не похоже на строку сессии: {exc}") from exc
+        try:
+            await client.connect()
+            if not await client.is_user_authorized():
+                await client.disconnect()
+                raise LoginError("Сессия неживая — аккаунт по ней не авторизован")
+        except LoginError:
+            raise
+        except Exception as exc:                          # noqa: BLE001
+            try:
+                await client.disconnect()
+            except Exception:                             # noqa: BLE001
+                pass
+            raise LoginError(f"Не удалось подключиться: {exc}") from exc
+
+        self._api = (api_id, api_hash)
+        self._phone = ""
+        self._pending = client
+        return await self._finish_login()
+
+    async def resend_code(self) -> str:
+        """Переотправка кода — просим Телеграм прислать его по SMS."""
+        if self._pending is None:
+            raise LoginError("Сессия входа потерялась, начни заново: /login")
+        try:
+            sent = await self._pending.send_code_request(self._phone, force_sms=True)
+            self._code_hash = sent.phone_code_hash
+            return _describe_code(sent)
+        except FloodWaitError as exc:
+            raise LoginError(f"Телеграм просит подождать {exc.seconds} секунд") from exc
+        except Exception as exc:                          # noqa: BLE001
+            raise LoginError(
+                f"Переотправить не вышло: {exc}. "
+                "Телеграм сам решает, каким способом слать код, и SMS разрешает не всегда"
+            ) from exc
 
     async def submit_code(self, code: str) -> TgAccount | None:
         """Шаг 2. Аккаунт — вошли, None — нужен пароль 2FA."""

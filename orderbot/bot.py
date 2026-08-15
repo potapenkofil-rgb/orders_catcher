@@ -39,6 +39,7 @@ HELP = """<b>Ловец заказов</b>
 
 <b>Телеграм-аккаунты</b> (можно несколько)
 /login — подключить ещё один аккаунт (api_id, api_hash, телефон, код, 2FA)
+/session — подключить готовой строкой сессии, если код не доходит
 /accounts — список аккаунтов: включить, выключить, отключить
 /chats — какие чаты и каналы слушаю
 
@@ -79,6 +80,12 @@ class AddAccount(StatesGroup):
     provider = State()
     email = State()
     password = State()
+
+
+class ImportSession(StatesGroup):
+    api_id = State()
+    api_hash = State()
+    session = State()
 
 
 class Login(StatesGroup):
@@ -199,13 +206,22 @@ async def login_api_hash(message: Message, state: FSMContext) -> None:
 @router.message(Login.phone)
 async def login_phone(message: Message, state: FSMContext, deps: Deps) -> None:
     phone = re.sub(r"[^\d+]", "", message.text or "")
-    if len(phone) < 8:
+    if not phone.startswith("+"):
+        phone = "+" + phone.lstrip("+")
+    if len(phone) < 9:
         await message.answer("Непохоже на номер. Формат: +79991234567")
+        return
+    if phone.startswith("+8") and len(phone) == 12:
+        await message.answer(
+            "⚠️ Номер начинается с <b>8</b> — это местный формат. "
+            "Нужен международный: <code>+7</code> вместо восьмёрки.\n"
+            "Пришли ещё раз или /cancel"
+        )
         return
     data = await state.get_data()
     await _quiet_delete(message)
     try:
-        await deps.userbot.start_login(data["api_id"], data["api_hash"], phone)
+        where = await deps.userbot.start_login(data["api_id"], data["api_hash"], phone)
     except LoginError as exc:
         await state.clear()
         await message.answer(f"❌ {esc(str(exc))}\n\nНачни заново: /login")
@@ -213,11 +229,26 @@ async def login_phone(message: Message, state: FSMContext, deps: Deps) -> None:
     await state.update_data(phone=phone)
     await state.set_state(Login.code)
     await message.answer(
-        "<b>Шаг 4 из 4.</b> Телеграм прислал код подтверждения.\n\n"
-        "⚠️ Пришли его <b>с разделителями</b>: <code>1-2-3-4-5</code> или <code>1 2 3 4 5</code>.\n"
+        f"<b>Шаг 4 из 4.</b> Код на <code>{esc(phone)}</code> отправлен "
+        f"<b>{esc(where)}</b>.\n\n"
+        "⚠️ Пришли его <b>с разделителями</b>: <code>1-2-3-4-5</code> или "
+        "<code>1 2 3 4 5</code>.\n"
         "Если отправить пятизначное число как есть, Телеграм увидит код в переписке "
-        "и сразу его аннулирует."
+        "и сразу его аннулирует.\n\n"
+        "Не пришёл никуда за пару минут — /resend (попробую по SMS). "
+        "Если и так пусто, скорее всего Телеграм не доставляет код на серверный "
+        "IP — тогда /cancel и смотри /session."
     )
+
+
+@router.message(Login.code, Command("resend"))
+async def login_resend(message: Message, deps: Deps) -> None:
+    try:
+        where = await deps.userbot.resend_code()
+    except LoginError as exc:
+        await message.answer(f"❌ {esc(str(exc))}")
+        return
+    await message.answer(f"Отправил ещё раз — {esc(where)}.")
 
 
 @router.message(Login.code)
@@ -299,6 +330,70 @@ async def cmd_tg_accounts(message: Message, deps: Deps) -> None:
             f"<b>{esc(account.title)}</b>\n{esc(_tg_state(deps, account))}",
             reply_markup=_tg_keyboard(account),
         )
+
+
+@router.message(Command("session"))
+async def cmd_session(message: Message, state: FSMContext) -> None:
+    await state.set_state(ImportSession.api_id)
+    await message.answer(
+        "<b>Подключение готовой сессией.</b>\n\n"
+        "Нужно, когда Телеграм не доставляет код входа — так бывает, если запрос "
+        "идёт с серверного IP. Логинишься на своём компьютере, а сюда отдаёшь "
+        "готовую строку сессии.\n\n"
+        "На компьютере:\n"
+        "<code>pip install telethon</code>\n"
+        "<code>python tools/make_session.py</code>\n\n"
+        "Скрипт спросит api_id, api_hash, телефон и код, потом напечатает строку. "
+        "Она даёт полный доступ к аккаунту — никому больше не показывай.\n\n"
+        "Пришли <code>api_id</code>. Отменить — /cancel"
+    )
+
+
+@router.message(ImportSession.api_id)
+async def session_api_id(message: Message, state: FSMContext) -> None:
+    raw = (message.text or "").strip()
+    if not raw.isdigit():
+        await message.answer("api_id — это число. Попробуй ещё раз или /cancel")
+        return
+    await state.update_data(api_id=int(raw))
+    await state.set_state(ImportSession.api_hash)
+    await message.answer("Теперь <code>api_hash</code> — тот же, с которым делал сессию.")
+
+
+@router.message(ImportSession.api_hash)
+async def session_api_hash(message: Message, state: FSMContext) -> None:
+    raw = (message.text or "").strip()
+    if len(raw) < 16:
+        await message.answer("Непохоже на api_hash. Попробуй ещё раз или /cancel")
+        return
+    await state.update_data(api_hash=raw)
+    await state.set_state(ImportSession.session)
+    await _quiet_delete(message)
+    await message.answer("Теперь саму строку сессии. Сообщение с ней я удалю.")
+
+
+@router.message(ImportSession.session)
+async def session_string(message: Message, state: FSMContext, deps: Deps) -> None:
+    session = (message.text or "").strip()
+    await _quiet_delete(message)
+    if len(session) < 40:
+        await message.answer("Строка слишком короткая. Попробуй ещё раз или /cancel")
+        return
+    data = await state.get_data()
+    note = await message.answer("Проверяю сессию…")
+    try:
+        account = await deps.userbot.add_by_session(
+            data["api_id"], data["api_hash"], session
+        )
+    except LoginError as exc:
+        await note.edit_text(f"❌ {esc(str(exc))}\n\nПопробовать снова — /session")
+        return
+    await state.clear()
+    await note.edit_text(
+        f"✅ Подключил <b>{esc(account.title)}</b>.\n"
+        f"Всего аккаунтов на связи: {len(deps.userbot.accounts)}.\n\n"
+        "Источники — /chats"
+    )
 
 
 @router.message(Command("logout"))
