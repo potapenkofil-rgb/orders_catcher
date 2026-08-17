@@ -2,3 +2,8 @@ aiogram>=3.7,<4
 telethon>=1.36,<2
 openai>=1.40
 aiosqlite>=0.20
+
+# Аккаунты нейросети (/addllm). Держатся отдельным файлом, но подключены сюда:
+# хостинг-панели ставят только requirements.txt, и без этой строки /addllm падает
+# с «No module named 'requests'». Не нужны — закомментируй строку ниже.
+-r requirements-accounts.txt

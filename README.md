@@ -73,7 +73,6 @@ cp .env.example .env
 
 - **Аккаунты нейросети.** `/addllm` прямо в боте: email и пароль от
   DeepSeek или Qwen. Ключ не нужен, платить не надо.
-  Требует `pip install -r requirements-accounts.txt`.
 - **Ключ.** `LLM_API_KEY` в `.env` — любой OpenAI-совместимый эндпоинт,
   по умолчанию `https://api.aitunnel.ru/v1`.
 
@@ -146,7 +145,11 @@ API development tools.
 
 Библиотеки клиентов лежат в `orderbot/vendor/` (см. `vendor/README.md`) —
 пришпиленные копии из проектов `betterDeepseek` и `betterQwen`, импортируются
-лениво.
+лениво. Их зависимости (`requests`, `numpy`, `py_mini_racer`) вынесены в
+`requirements-accounts.txt`, но подключены строкой `-r` в основной
+`requirements.txt` — иначе хостинг-панели, которые ставят только его, роняли бы
+`/addllm` с «No module named 'requests'». Не нужны аккаунты — закомментируй эту
+строку, минус ~25 МБ памяти и ~100 МБ диска.
 
 > Пароли лежат в локальной базе (`data/orderbot.db`) как есть — иначе боту нечем
 > перелогиниться, когда протухнет токен. База в `.gitignore`, но это обычный файл
