@@ -49,6 +49,7 @@ HELP = """<b>Ловец заказов</b>
 
 <b>Управление</b>
 /status — что происходит прямо сейчас
+/newchat — начать чаты с моделью заново (после смены промптов)
 /pause — приостановить приём
 /resume — продолжить
 /stats — статистика
@@ -487,6 +488,17 @@ async def cmd_resume(message: Message, deps: Deps) -> None:
     await message.answer("▶️ Продолжаю слушать чаты.")
 
 
+@router.message(Command("newchat"))
+async def cmd_newchat(message: Message, deps: Deps) -> None:
+    await deps.classifier.reset_chats()
+    await message.answer(
+        "Начал чаты с моделью заново. Системный промпт уйдёт свежий "
+        "уже со следующей пачки.\n\n"
+        f"Этап 1: <code>{esc(deps.classifier.chat1.session_id)}</code>\n"
+        f"Этап 2: <code>{esc(deps.classifier.chat2.session_id)}</code>"
+    )
+
+
 @router.message(Command("stats"))
 async def cmd_stats(message: Message, deps: Deps) -> None:
     today = await deps.db.stats_today()
@@ -497,6 +509,7 @@ async def cmd_stats(message: Message, deps: Deps) -> None:
             f"  сообщений: {source.get('seen', 0)}\n"
             f"  в очередь: {source.get('queued', 0)}\n"
             f"  дублей отброшено: {source.get('skipped_duplicate', 0)}\n"
+            f"  барахолки отброшено: {source.get('skipped_junk', 0)}\n"
             f"  по ЧС отброшено: {source.get('skipped_blacklist', 0)}\n"
             f"  прошли этап 1: {source.get('stage1_passed', 0)}\n"
             f"  прошли этап 2: {source.get('stage2_passed', 0)}\n"

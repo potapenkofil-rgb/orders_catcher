@@ -24,6 +24,7 @@ from orderbot.models import Candidate, Verdict
 from orderbot.notifier import build_keyboard, render
 from orderbot.pipeline import Pipeline
 from orderbot.state import Runtime
+from orderbot.utils import truncate
 from orderbot.userbot import TgAccount, UserBot, UserBotManager
 
 ok = 0
@@ -349,6 +350,32 @@ def test_soft_leads():
                  "где взять софт для накрутки"]:
         check(f"фолбэк знает про софт: {text}", bool(_FALLBACK_RE.search(text)))
 
+    from orderbot.classifier import JUNK_RE
+
+    # реальные ложные срабатывания, которые ловил бот на живых чатах
+    junk = [
+        "КУПЛЮ ГОТОВЫЕ Новофон физ/ИП/ООО Ростелеком АТС/8800 Билайн АТС/8800 Гарант+++",
+        "Дайте макс нерег, плачу 4.5$, оплата момент",
+        "Куплю много аккаунтов гугл. Новорег. Оптом.",
+        "продам акки тг нерег дёшево, оплата любая",
+        "куплю сим карты оптом, дорого, пишите в лс",
+        "приму аккаунты вб, выкуп аккаунтов, гарант",
+    ]
+    for text in junk:
+        check(f"барахолка режется: {truncate(text, 34)}", bool(JUNK_RE.search(text)))
+
+    not_junk = [
+        "куплю парсер чатов, готов заплатить",
+        "куплю софт для инвайтинга",
+        "куплю бота для автоответов в лс",
+        "Требуется доработать парсер номеров телефонов с сайта, оплата 15к",
+        "Нужен разработчик телеграм-бота, бюджет 30000",
+        "ищу бота для рассылки",
+    ]
+    for text in not_junk:
+        check(f"лид не попал под барахолку: {truncate(text, 30)}",
+              not JUNK_RE.search(text))
+
     v = Verdict(is_order=True, confidence=0.8, category="softbot",
                 stack="рассылка по группам, инвайтинг")
     text = render(cand("ищу бота для рассылки"), v)
@@ -404,6 +431,11 @@ async def test_chat_sessions():
     await chat.remember(first_id, "старое", "ответ")      # ответ из прошлого чата
     check("в новый чат старое не дописывается",
           [m["role"] for m in chat.messages("s", "u")] == ["system", "user"])
+
+    before = chat.session_id
+    await chat.rotate_now()
+    check("принудительная смена чата даёт новый id", chat.session_id != before)
+    check("принудительная смена считается", chat.rotations == 2)
 
     plain = ChatSession("stage2", ttl=3600, history_turns=0)
     sid = await plain.begin()
@@ -691,6 +723,16 @@ async def test_pipeline(tmp):
     await pipe.ingest(second)
     check("второй аккаунт то же сообщение не дублирует",
           pipe.buffer.pending == pending_before + 1)
+
+    await pipe.ingest(cand("Куплю много аккаунтов гугл. Новорег. Оптом. Пишите в лс",
+                           msg_id=50, author_id=50))
+    check("барахолка не доходит до LLM", pipe.buffer.pending == pending_before + 1)
+    await pipe.ingest(cand("КУПЛЮ ГОТОВЫЕ Новофон физ/ИП/ООО, Ростелеком АТС/8800, гарант",
+                           msg_id=51, author_id=51))
+    check("покупка номеров и юрлиц тоже", pipe.buffer.pending == pending_before + 1)
+    junk_stats = await db.stats_today()
+    check("барахолка попадает в статистику", junk_stats.get("skipped_junk") == 2,
+          f"({junk_stats.get('skipped_junk')})")
 
     batch = [
         cand("Ищу на заказ разработчика бота, бюджет 20к", msg_id=10, author_id=1),

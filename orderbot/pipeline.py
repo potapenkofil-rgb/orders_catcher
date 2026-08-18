@@ -7,7 +7,7 @@ import time
 from collections import deque
 
 from .buffer import BatchBuffer
-from .classifier import SHORT_LEAD_RE, Classifier
+from .classifier import JUNK_RE, SHORT_LEAD_RE, Classifier
 from .config import Config
 from .dedup import DedupIndex
 from .models import Candidate, Verdict
@@ -69,6 +69,12 @@ class Pipeline:
         # Короткие лиды («ищу бота для рассылки» — 21 символ) не проходят по длине,
         # хотя это самые чистые заявки. Для них исключение из порога.
         if len(text) < self.cfg.min_text_len and not SHORT_LEAD_RE.search(text):
+            return
+
+        # Барахолка («куплю акки», «продам симки») — не заказы никогда,
+        # а модель на них ведётся. Режем здесь, до всяких запросов.
+        if JUNK_RE.search(text):
+            await db.bump("skipped_junk")
             return
 
         # Дубликаты режем до LLM: одно объявление часто висит в десятке чатов.

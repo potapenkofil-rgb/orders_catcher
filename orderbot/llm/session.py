@@ -52,6 +52,12 @@ class ChatSession:
     def age(self) -> float:
         return max(0.0, time.time() - self.started)
 
+    async def rotate_now(self) -> None:
+        """Сменить чат немедленно — например, после правки промптов."""
+        async with self._lock:
+            self.rotations += 1
+            self._start_new()
+
     async def begin(self) -> str:
         """id текущего чата. При необходимости чат сменится на новый."""
         async with self._lock:
