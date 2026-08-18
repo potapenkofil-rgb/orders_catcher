@@ -139,6 +139,11 @@ class Pipeline:
     def _accept(self, verdict: Verdict) -> bool:
         if not verdict.is_order:
             return False
+        # Модель обязана назвать, что именно программировать. Нечего назвать —
+        # значит заказа нет, а есть додуманная за автора задача.
+        if len(verdict.stack.strip()) < 4:
+            log.debug("Отбраковка: модель не назвала, что писать (%s)", verdict.reason)
+            return False
         if verdict.confidence < self.runtime.min_confidence:
             log.debug("Отбраковка по порогу: %.2f < %.2f",
                       verdict.confidence, self.runtime.min_confidence)

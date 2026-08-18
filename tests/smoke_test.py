@@ -312,7 +312,11 @@ class StubClassifier:
         if "слабый" in low:
             return Verdict(is_order=True, confidence=0.3, category="order")
         if "вакансия" in low:
-            return Verdict(is_order=True, confidence=0.9, category="vacancy")
+            return Verdict(is_order=True, confidence=0.9, category="vacancy",
+                           stack="бэкенд на Go")
+        if "пустой стек" in low:
+            # модель сказала «заказ», но не смогла назвать, что писать
+            return Verdict(is_order=True, confidence=0.95, category="order", stack="")
         if "взрыв" in low:
             raise RuntimeError("модель упала")
         if "рассылк" in low:
@@ -742,15 +746,18 @@ async def test_pipeline(tmp):
         cand("Заказ-вакансия: ищем питониста в команду на удалёнку", msg_id=14, author_id=5),
         cand("Взрыв заказ: тут модель падает с ошибкой", msg_id=15, author_id=6),
         cand("Ищу бота для рассылки по группам и инвайтинга", msg_id=16, author_id=7),
+        cand("Заказ с пустой стек: нужно сделать что-нибудь хорошее", msg_id=17,
+             author_id=8),
     ]
     await pipe.process_batch(batch)
     check("этап 1 вызван один раз", clf.stage1_calls == 1)
-    check("этап 2 только по прошедшим", clf.stage2_calls == 6, f"({clf.stage2_calls})")
+    check("этап 2 только по прошедшим", clf.stage2_calls == 7, f"({clf.stage2_calls})")
     sent_ids = sorted(c.msg_id for c, _ in notifier.sent)
     check("отправлены заказ, вакансия и софт-лид",
           sent_ids == [10, 14, 16], f"({sent_ids})")
     check("низкая уверенность не отправлена", 13 not in sent_ids)
     check("падение этапа 2 не роняет батч", 15 not in sent_ids)
+    check("без ответа «что писать» уведомление не уходит", 17 not in sent_ids)
 
     stats = await db.stats_today()
     # один дубль по тексту (то же объявление в другом чате) + один по id сообщения
